@@ -12,11 +12,14 @@ import {
   DriftRecord,
   DriftType,
   RECONCILIATION_EVENTS,
+  RECONCILIATION_DRIFT_METRIC,
   DEFAULT_ESCROW_RECONCILIATION_SWEEP_CONCURRENCY,
+  DEFAULT_DRIFT_CONFIRMATION_THRESHOLD,
   ReconciliationError,
   ReconciliationRun,
 } from './escrow-reconciliation.types';
 import { InvalidChainStateError } from './chain-escrow.validation';
+import { MetricsService } from '../monitoring/metrics.service';
 import { config } from '../config/env.config';
 
 interface ReconciliationTarget {
@@ -38,16 +41,38 @@ type ChainReadResult =
  * so "escrow exists on chain but never made it into the DB" (a missed creation
  * event) is only detected for `contractEscrowId`s a caller explicitly supplies —
  * e.g. from an ops backfill list — rather than by scanning the entire contract.
+ *
+ * Drift debounce (#865): a single mismatched read on Soroban testnet can be caused
+ * by a short-lived ledger reorg that self-corrects within a ledger or two. To avoid
+ * false-positive alerts, field-level drift (STATUS_MISMATCH / AMOUNT_MISMATCH) must
+ * be observed on at least DEFAULT_DRIFT_CONFIRMATION_THRESHOLD consecutive sweeps
+ * before the alert webhook is dispatched. Repair still happens immediately so the DB
+ * stays in sync with chain; it is only the alert that is held back until the drift
+ * is confirmed persistent.
+ *
+ * Pre-cutoff backfill (#866): findAll() returns every escrow regardless of creation
+ * date. There is no reconciliationEnabledAt cutoff filter — all active escrows are
+ * candidates for each sweep, so escrows created before the feature was enabled are
+ * reconciled automatically on the next run.
  */
 @Injectable()
 export class EscrowReconciliationService {
   private readonly logger = new SanitizedLogger(EscrowReconciliationService.name);
+
+  /**
+   * Per-escrow consecutive-drift counter, keyed by contractEscrowId (#865).
+   * Incremented each sweep a field drift is detected; reset to zero when chain
+   * and DB agree. A webhook alert is only raised once the count reaches the
+   * threshold, so a single reorg-induced mismatch does not produce a noisy alert.
+   */
+  private readonly consecutiveDriftCount = new Map<string, number>();
 
   constructor(
     private readonly escrowService: EscrowService,
     private readonly chainClient: EscrowChainStateClient,
     private readonly webhookService: WebhookService,
     private readonly store: EscrowReconciliationStateStore,
+    private readonly metrics: MetricsService,
   ) {}
 
   async findById(runId: string): Promise<ReconciliationRun | undefined> {
@@ -66,6 +91,10 @@ export class EscrowReconciliationService {
 
     const all = await this.escrowService.findAll();
     const linked = all.filter(e => e.contractEscrowId);
+    // findAll() returns every escrow regardless of creation date — there is no
+    // reconciliationEnabledAt cutoff (#866). All escrows with a contractEscrowId are
+    // candidates for each sweep, so escrows created before the reconciliation feature
+    // was enabled are automatically included and will be reconciled on the next run.
 
     const knownIds = new Set(linked.map(e => e.contractEscrowId as string));
 
@@ -167,15 +196,39 @@ export class EscrowReconciliationService {
       }
 
       if (fieldDrifts.length > 0) {
+        // Track consecutive field-level drifts for reorg debounce (#865).
+        // A single mismatched read on Soroban testnet can be caused by a short-lived
+        // ledger reorg that self-corrects within a ledger or two. Repair still happens
+        // immediately so the DB tracks chain state; the alert webhook is withheld until
+        // the same escrow has drifted on DEFAULT_DRIFT_CONFIRMATION_THRESHOLD consecutive
+        // sweeps, confirming the drift is persistent rather than a transient reorg blip.
+        const prevCount = this.consecutiveDriftCount.get(target.contractEscrowId) ?? 0;
+        const newCount = prevCount + 1;
+        this.consecutiveDriftCount.set(target.contractEscrowId, newCount);
+        // Annotate each drift record with the confirmation count for observability.
+        for (const d of fieldDrifts) {
+          d.consecutiveDriftCount = newCount;
+        }
         // Pass the version we saw when detecting drift for optimistic locking
         await this.repair(fieldDrifts, escrow.id, chainEscrow.record, escrow.version);
         drifts.push(...fieldDrifts);
+      } else {
+        // No field drift this sweep — reset the consecutive counter so a future single
+        // reorg-blip after a clean period does not inherit a stale count.
+        this.consecutiveDriftCount.delete(target.contractEscrowId);
       }
     }
 
     // Every target was read and diffed above, including the ones whose read failed — a
     // failed read is still an escrow that was checked, and the error is reported separately.
     const checked = targets.length;
+
+    // Emit drift counters labelled by outcome so dashboards can distinguish auto-corrected
+    // drift from drift that only produced an alert and requires manual review (#867).
+    for (const drift of drifts) {
+      const outcome = drift.repaired ? 'auto_corrected' : 'alert_only';
+      this.metrics.increment(RECONCILIATION_DRIFT_METRIC, { outcome });
+    }
 
     const run: ReconciliationRun = {
       runId,
@@ -191,12 +244,35 @@ export class EscrowReconciliationService {
 
     await this.store.save(run);
 
-    if (drifts.length > 0 || errors.length > 0) {
+    // Only dispatch the DRIFT_DETECTED webhook when at least one field-level drift has
+    // persisted across the minimum confirmation threshold of consecutive sweeps (#865).
+    // Structural drifts (MISSING_ON_CHAIN, MISSING_IN_DB, INVALID_CHAIN_DATA) and read
+    // errors are always alerted immediately — they are not reorg-induced.
+    const confirmationThreshold = DEFAULT_DRIFT_CONFIRMATION_THRESHOLD;
+    const confirmedFieldDrifts = drifts.filter(
+      d =>
+        (d.driftType === DriftType.STATUS_MISMATCH || d.driftType === DriftType.AMOUNT_MISMATCH) &&
+        (d.consecutiveDriftCount ?? 1) >= confirmationThreshold,
+    );
+    const structuralDrifts = drifts.filter(
+      d =>
+        d.driftType !== DriftType.STATUS_MISMATCH && d.driftType !== DriftType.AMOUNT_MISMATCH,
+    );
+    const shouldAlert = confirmedFieldDrifts.length > 0 || structuralDrifts.length > 0 || errors.length > 0;
+
+    if (shouldAlert) {
       this.logger.warn(
-        `Reconciliation ${runId}: ${drifts.length} drift(s) and ${errors.length} read error(s) ` +
-          `across ${targets.length} escrow(s)`,
+        `Reconciliation ${runId}: ${drifts.length} drift(s) (${confirmedFieldDrifts.length} confirmed field drift(s)) ` +
+          `and ${errors.length} read error(s) across ${targets.length} escrow(s)`,
       );
       await this.webhookService.dispatch(RECONCILIATION_EVENTS.DRIFT_DETECTED, run);
+    } else if (drifts.length > 0) {
+      // Drifts detected but not yet confirmed as persistent — log at warn but do not alert.
+      this.logger.warn(
+        `Reconciliation ${runId}: ${drifts.length} unconfirmed field drift(s) across ` +
+          `${targets.length} escrow(s) — withholding alert until drift persists for ` +
+          `${confirmationThreshold} consecutive sweep(s) (reorg debounce #865)`,
+      );
     } else {
       this.logger.log(
         `Reconciliation ${runId}: no drift or read errors across ${targets.length} escrow(s)`,

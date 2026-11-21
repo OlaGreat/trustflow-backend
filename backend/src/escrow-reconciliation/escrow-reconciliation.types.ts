@@ -32,6 +32,13 @@ export interface DriftRecord {
    * `ADMIN_DASHBOARD_URL` isn't configured.
    */
   adminUrl?: string;
+  /**
+   * Number of consecutive reconciliation sweeps on which field-level drift (STATUS_MISMATCH
+   * or AMOUNT_MISMATCH) has been detected for this escrow (#865 reorg debounce).
+   * Not set for structural drifts (MISSING_ON_CHAIN, MISSING_IN_DB, INVALID_CHAIN_DATA).
+   * The alert webhook is withheld until this reaches DEFAULT_DRIFT_CONFIRMATION_THRESHOLD.
+   */
+  consecutiveDriftCount?: number;
 }
 
 export interface ReconciliationError {
@@ -59,5 +66,28 @@ export const RECONCILIATION_EVENTS = {
   ESCROW_BACKFILLED: 'escrow_reconciliation.escrow_backfilled',
 } as const;
 
+/**
+ * Prometheus counter name for reconciliation drift events.
+ * Carries an `outcome` label to distinguish drift that was auto-corrected
+ * from drift that only triggered an alert for manual review (#867).
+ *
+ * Label values:
+ *   - `auto_corrected` — the reconciler wrote the chain state back to the DB.
+ *   - `alert_only`     — the drift was recorded but not automatically repaired.
+ */
+export const RECONCILIATION_DRIFT_METRIC = 'reconciliation_drift_total';
+
 export const DEFAULT_ESCROW_RECONCILIATION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 export const DEFAULT_ESCROW_RECONCILIATION_SWEEP_CONCURRENCY = 8;
+
+/**
+ * Minimum number of consecutive reconciliation sweeps on which field-level drift
+ * (STATUS_MISMATCH / AMOUNT_MISMATCH) must be observed before the DRIFT_DETECTED
+ * webhook alert is dispatched (#865 — reorg debounce).
+ *
+ * Set to 2 so a single transient mismatch caused by a Soroban ledger reorg does
+ * not produce a noisy false-positive alert, while persistent real drift is still
+ * surfaced after the second sweep (typically within 20 minutes at the default
+ * 10-minute sweep interval).
+ */
+export const DEFAULT_DRIFT_CONFIRMATION_THRESHOLD = 2;
